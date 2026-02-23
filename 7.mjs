@@ -1,7 +1,6 @@
 import express from 'express';
-import bodyParser from 'body-parser';
 import fs from 'fs/promises';
-import { existsSync, createReadStream, statSync } from 'fs';
+import { existsSync, createReadStream } from 'fs';
 import path from 'path';
 import { chromium } from 'playwright-core';
 import MarkdownIt from 'markdown-it';
@@ -34,30 +33,32 @@ const CHROMIUM_PATH = getChromiumPath();
 const md = new MarkdownIt({ html: true });
 const app = express();
 
-app.use(bodyParser.json({ limit: '50mb' }));
+// Modern Express Built-in Body Parser
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// --- SECURITY HELPER ---
+function safeJoin(base, target) {
+    const targetPath = target || '';
+    const resolvedPath = path.join(base, targetPath);
+    if (!resolvedPath.startsWith(base)) {
+        throw new Error("Forbidden Path Access");
+    }
+    return resolvedPath;
+}
 
 // --- COMPRESSION HELPER (OPTIMIZED) ---
 function compressPDF(inputPath, outputPath) {
     try {
-        // Check for Ghostscript
         try { execSync('which gs'); } catch { 
             console.log("Ghostscript not found, skipping compression"); 
             return false; 
         }
 
-        // AGGRESSIVE COMPRESSION COMMAND
-        // -dSubsetFonts=true: Removes unused characters from the font (Crucial for Urdu)
-        // -dCompressFonts=true: Compresses the font data
-        // /ebook: Balanced quality/size (150dpi)
         const cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dSubsetFonts=true -dCompressFonts=true -dDetectDuplicateImages=true -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outputPath}" "${inputPath}"`;
-        
         execSync(cmd);
         
-        // Check if output exists and is valid
-        if (existsSync(outputPath)) {
-            return true;
-        }
-        return false;
+        return existsSync(outputPath);
     } catch (e) { 
         console.error("Compression Error:", e.message);
         return false; 
@@ -70,7 +71,6 @@ h1 { background: #f4f6f8; color: #3b4455; font-family: Georgia, serif; font-size
 h2 { color: #1a237e; font-size: 18pt; font-family: Georgia, serif; border-left: 6px solid #1a237e; padding-left: 15px; margin-top: 30px; margin-bottom: 15px; }
 p { text-align: justify; margin-bottom: 15px; }`;
 
-// Added format('truetype') to help renderer
 const DEFAULT_URDU = `@font-face { font-family: 'JameelNoori'; src: url('http://localhost:${FONT_PORT}/font') format('truetype'); }
 body { font-family: 'JameelNoori', 'Noto Nastaliq Urdu', serif; direction: rtl; line-height: 2.4; color: #000; text-align: right; }
 .uni-name, .uni-city { font-family: "Times New Roman", serif; direction: ltr; }
@@ -89,7 +89,7 @@ const startFontServer = () => {
                 res.writeHead(404); res.end('Font not found'); return;
             }
             res.setHeader('Content-Type', 'font/ttf');
-            res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache header
+            res.setHeader('Cache-Control', 'public, max-age=31536000'); 
             createReadStream(fontPath).pipe(res);
         } else {
             res.writeHead(404); res.end('Not found');
@@ -143,12 +143,7 @@ async function saveThemes(data) {
 const BASE_CSS = `
     * { box-sizing: border-box; }
     @page { size: A4; margin: 0; }
-    
-    body { 
-        margin: 0; 
-        background: white;
-    }
-
+    body { margin: 0; background: white; }
     .cover-wrapper { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; height: 90vh; width: 100%; }
     .logo-img { width: 140px; margin-bottom: 20px; }
     .assignment-title { font-size: 28pt; font-weight: 800; color: #44546a; border-top: 2px solid #ddd; border-bottom: 2px solid #ddd; padding: 15px 40px; margin-bottom: 40px; background: #f9f9f9; width: 100%; }
@@ -157,13 +152,7 @@ const BASE_CSS = `
     .details-table .label-col { background: #f0f2f5; font-weight: bold; width: 40%; color: #1a237e; }
     .details-table .value-col { width: 60%; font-weight: bold; }
     .content-body { width: 100%; }
-    
-    h1 {
-        page-break-before: always;
-        break-before: page;
-        margin-top: 0;
-    }
-
+    h1 { page-break-before: always; break-before: page; margin-top: 0; }
     .page-break { page-break-after: always; }
     img { max-width: 100%; height: auto; display: block; margin: 20px auto; }
 `;
@@ -198,9 +187,8 @@ const PDF_TEMPLATE = `
 
 app.get('/api/files', async (req, res) => {
     try {
-        const currentPath = req.query.path || '';
-        const dir = path.join(MD_DIR, currentPath);
-        if (!dir.startsWith(MD_DIR) || !existsSync(dir)) return res.json([]);
+        const dir = safeJoin(MD_DIR, req.query.path);
+        if (!existsSync(dir)) return res.json([]);
         const files = await fs.readdir(dir, { withFileTypes: true });
         res.json(files.map(d => ({ 
             name: d.name, isDir: d.isDirectory(), relativePath: path.relative(MD_DIR, path.join(dir, d.name))
@@ -210,33 +198,42 @@ app.get('/api/files', async (req, res) => {
 
 app.get('/api/file-content', async (req, res) => {
     try {
-        const content = await fs.readFile(path.join(MD_DIR, req.query.path), 'utf-8');
+        const target = safeJoin(MD_DIR, req.query.path);
+        const content = await fs.readFile(target, 'utf-8');
         res.json({ content });
     } catch (e) { res.status(404).send(''); }
 });
 
 app.post('/api/save', async (req, res) => {
-    const target = path.join(MD_DIR, req.body.path);
-    await fs.writeFile(target, req.body.content);
-    res.json({ success: true });
+    try {
+        const target = safeJoin(MD_DIR, req.body.path);
+        await fs.writeFile(target, req.body.content);
+        res.json({ success: true });
+    } catch (e) { res.status(400).json({ success: false, error: e.message }); }
 });
 
 app.post('/api/folder/create', async (req, res) => {
-    const target = path.join(MD_DIR, req.body.path);
-    await fs.mkdir(target, { recursive: true });
-    res.json({ success: true });
+    try {
+        const target = safeJoin(MD_DIR, req.body.path);
+        await fs.mkdir(target, { recursive: true });
+        res.json({ success: true });
+    } catch (e) { res.status(400).json({ success: false }); }
 });
 
 app.post('/api/delete', async (req, res) => {
-    const target = path.join(MD_DIR, req.body.path);
-    await fs.rm(target, { recursive: true, force: true });
-    res.json({ success: true });
+    try {
+        const target = safeJoin(MD_DIR, req.body.path);
+        await fs.rm(target, { recursive: true, force: true });
+        res.json({ success: true });
+    } catch (e) { res.status(400).json({ success: false }); }
 });
 
 app.post('/api/import', async (req, res) => {
-    const target = path.join(MD_DIR, req.body.path, req.body.filename);
-    await fs.writeFile(target, req.body.content);
-    res.json({ success: true });
+    try {
+        const target = safeJoin(MD_DIR, path.join(req.body.path, req.body.filename));
+        await fs.writeFile(target, req.body.content);
+        res.json({ success: true });
+    } catch (e) { res.status(400).json({ success: false }); }
 });
 
 app.get('/api/themes', async (req, res) => {
@@ -300,6 +297,7 @@ app.post('/api/magic-find', async (req, res) => {
 // --- GENERATE PDF ---
 app.post('/api/generate-pdf', async (req, res) => {
     let browser;
+    let page;
     let tempHtmlPath = null;
     let tempPdfPath = null;
     
@@ -328,11 +326,7 @@ app.post('/api/generate-pdf', async (req, res) => {
         let labels = { name: "Submitted By", roll: "Registration Number", course: "Course Code", semester: "Semester" };
         let values = { name: config.name, roll: config.roll, course: courseCode, semester: config.semester };
         let titleLine = `ASSIGNMENT ${assignNum}`;
-        
-        let footerHtml = `
-            <div style="width:100%; text-align:center; font-size:10px; color:#555; padding-top:20px; font-family:sans-serif;">
-                Page <span class="pageNumber"></span> of <span class="totalPages"></span>
-            </div>`;
+        let footerHtml = `<div style="width:100%; text-align:center; font-size:10px; color:#555; padding-top:20px; font-family:sans-serif;">Page <span class="pageNumber"></span> of <span class="totalPages"></span></div>`;
 
         if (isUrdu) {
             labels = { name: "نام طالب علم", roll: "رجسٹریشن نمبر", course: "کورس کوڈ", semester: "سمسٹر" };
@@ -341,13 +335,8 @@ app.post('/api/generate-pdf', async (req, res) => {
             values.course = courseCode;
             values.semester = config.semesterUrdu || config.semester;
             const urduNumMap = { '1': 'اول', '2': 'دوم', '3': 'سوم', '4': 'چہارم', '5': 'پنجم' };
-            const urduNum = urduNumMap[assignNum] || assignNum;
-            titleLine = `اسائنمنٹ ${urduNum}`;
-            
-            footerHtml = `
-                <div style="width:100%; text-align:center; font-size:14px; color:#000; padding-top:20px; font-family:'JameelNoori', serif; direction:rtl;">
-                    صفحہ نمبر <span class="pageNumber"></span>
-                </div>`;
+            titleLine = `اسائنمنٹ ${urduNumMap[assignNum] || assignNum}`;
+            footerHtml = `<div style="width:100%; text-align:center; font-size:14px; color:#000; padding-top:20px; font-family:'JameelNoori', serif; direction:rtl;">صفحہ نمبر <span class="pageNumber"></span></div>`;
         }
 
         const finalHtml = PDF_TEMPLATE
@@ -362,53 +351,32 @@ app.post('/api/generate-pdf', async (req, res) => {
             .replace('{{L_SEMESTER}}', labels.semester).replace('{{V_SEMESTER}}', values.semester || '')
             .replace('{{CONTENT}}', bodyHtml);
 
-        // --- DETERMINE PATHS ---
-        let saveDir;
-        if (existsSync('/sdcard')) {
-            const safeName = (config.name || 'Student').replace(/[^a-z0-9]/gi, '_');
-            saveDir = path.join('/sdcard', safeName);
-        } else {
-            saveDir = path.join(__dirname, 'Generated_Assignments', (config.name || 'Student').replace(/[^a-z0-9]/gi, '_'));
-        }
+        let saveDir = path.join(__dirname, 'Generated_Assignments', (config.name || 'Student').replace(/[^a-z0-9]/gi, '_'));
         if (!existsSync(saveDir)) await fs.mkdir(saveDir, { recursive: true });
 
-        // --- SAVE TEMP HTML FILE (MD -> HTML) ---
         const cleanFilename = filename ? filename.replace('.md', '') : `Assignment_${assignNum}`;
         tempHtmlPath = path.join(saveDir, `temp_${cleanFilename}.html`);
         await fs.writeFile(tempHtmlPath, finalHtml, 'utf-8');
 
-        // --- BROWSER GENERATION ---
         browser = await chromium.launch({ executablePath: CHROMIUM_PATH, args: ['--no-sandbox'] });
-        const page = await browser.newPage();
+        page = await browser.newPage();
         
-        // Load the local HTML file
         await page.goto(`file://${tempHtmlPath}`, { waitUntil: 'networkidle' });
-        
-        // Ensure fonts are actually loaded before printing
-        await page.evaluate(async () => {
-            await document.fonts.ready;
-        });
+        await page.evaluate(async () => { await document.fonts.ready; });
 
         const pdfBuffer = await page.pdf({
-            format: 'A4', 
-            printBackground: true, 
-            displayHeaderFooter: true,
-            headerTemplate: '<div></div>',
-            footerTemplate: footerHtml,
+            format: 'A4', printBackground: true, displayHeaderFooter: true,
+            headerTemplate: '<div></div>', footerTemplate: footerHtml,
             margin: { top: '0mm', right: '0mm', bottom: '0mm', left: '0mm' }
         });
 
-        // --- SAVE TEMP PDF ---
         const finalPdfName = `${cleanFilename}.pdf`;
         const finalPdfPath = path.join(saveDir, finalPdfName);
         tempPdfPath = path.join(saveDir, `uncompressed_${finalPdfName}`);
         
         await fs.writeFile(tempPdfPath, pdfBuffer);
 
-        // --- COMPRESS ---
-        const isCompressed = compressPDF(tempPdfPath, finalPdfPath);
-        
-        if (!isCompressed) {
+        if (!compressPDF(tempPdfPath, finalPdfPath)) {
             await fs.rename(tempPdfPath, finalPdfPath);
         }
 
@@ -418,10 +386,9 @@ app.post('/api/generate-pdf', async (req, res) => {
         console.error(e);
         res.status(500).json({ success: false, error: e.message });
     } finally {
+        if (page) await page.close(); // Prevents memory leaks
         if (browser) await browser.close();
-        // Cleanup temp HTML
         if (tempHtmlPath && existsSync(tempHtmlPath)) await fs.unlink(tempHtmlPath);
-        // Cleanup temp PDF if it still exists (if compression worked, tempPdfPath is leftover)
         if (tempPdfPath && existsSync(tempPdfPath)) await fs.unlink(tempPdfPath);
     }
 });
@@ -448,37 +415,50 @@ app.get('/', (req, res) => {
         @keyframes fadeUp { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
         .card { background: var(--surface); border-radius: 16px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.04); border: 1px solid #fff; }
         .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; color: #555; font-weight: 600; font-size: 0.9rem; text-transform: uppercase; }
-        .file-list .item { display: flex; align-items: center; padding: 12px; background: #fff; border: 1px solid #eee; border-radius: 8px; margin-bottom: 8px; cursor: pointer; justify-content: space-between; }
-        textarea, input, select { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; margin-bottom: 10px; }
-        .btn { width: 100%; padding: 12px; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; color: white; background: var(--primary); margin-top: 5px; }
+        .file-list .item { display: flex; align-items: center; padding: 12px; background: #fff; border: 1px solid #eee; border-radius: 8px; margin-bottom: 8px; cursor: pointer; justify-content: space-between; transition: 0.2s; }
+        .file-list .item:hover { border-color: var(--primary); }
+        textarea, input, select { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; margin-bottom: 10px; font-family:inherit; box-sizing: border-box;}
+        .btn { width: 100%; padding: 12px; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; color: white; background: var(--primary); margin-top: 5px; transition: 0.2s; }
+        .btn:hover { opacity: 0.9; transform: translateY(-1px); }
         nav { position: fixed; bottom: 0; width: 100%; background: #fff; display: flex; justify-content: space-around; padding: 12px 0; border-top: 1px solid #eee; z-index: 20; }
-        .nav-btn { background: none; border: none; display: flex; flex-direction: column; align-items: center; color: #999; font-size: 0.7rem; font-weight: 600; gap: 4px; }
+        .nav-btn { background: none; border: none; display: flex; flex-direction: column; align-items: center; color: #999; font-size: 0.7rem; font-weight: 600; gap: 4px; cursor: pointer; }
         .nav-btn.active { color: var(--primary); }
         .nav-btn i { font-size: 1.4rem; }
         .folder-icon { color: #fbc02d; margin-right: 10px; }
         .file-icon { color: #90a4ae; margin-right: 10px; }
-        .action-icon { color: #888; margin-left:10px; padding:5px; }
+        .action-icon { color: #f44336; margin-left:10px; padding:5px; cursor:pointer; }
+        
+        /* Modern Toast Notification */
+        #toast { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 8px; padding: 16px; position: fixed; z-index: 100; left: 50%; bottom: 80px; transform: translateX(-50%); font-size: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); transition: opacity 0.3s; opacity: 0; }
+        #toast.show { visibility: visible; opacity: 1; }
+        
+        /* Loading Spinner */
+        .spinner { display: inline-block; width: 16px; height: 16px; border: 3px solid rgba(0,96,100,0.3); border-radius: 50%; border-top-color: var(--primary); animation: spin 1s ease-in-out infinite; margin-right: 8px; vertical-align: middle; }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
-    <header><h1>AIOU Studio</h1><div id="status">Ready</div></header>
+    <header>
+        <h1>AIOU Studio</h1>
+        <div id="status" style="font-size: 12px; color: #666; font-weight:600;"><i class="fa-solid fa-circle-check" style="color:#4caf50"></i> Ready</div>
+    </header>
     <main>
         <!-- HOME -->
         <div id="tab-home" class="tab active">
             <div class="card">
                 <input type="text" id="magicCode" placeholder="Magic Find (e.g. 1423 1424)">
-                <button onclick="magicFind()" class="btn">Find Assignments</button>
+                <button onclick="magicFind()" class="btn"><i class="fa-solid fa-magnifying-glass"></i> Find Assignments</button>
             </div>
             <div id="magicResults"></div>
             
             <div class="card" style="margin-top:20px;">
                 <div class="card-head">
-                    <span id="currentPathLabel">/</span>
+                    <span id="currentPathLabel" style="font-family:monospace; background:#eee; padding:2px 6px; border-radius:4px; font-size:11px;">/</span>
                     <div style="display:flex; gap:5px;">
                         <input type="file" id="fileImport" style="display:none" onchange="importFile(this)">
-                        <button class="btn" style="width:auto; padding:5px 10px; background:#4caf50;" onclick="document.getElementById('fileImport').click()"><i class="fa-solid fa-upload"></i></button>
-                        <button class="btn" style="width:auto; padding:5px 10px; background:#fbc02d;" onclick="createFolder()"><i class="fa-solid fa-folder-plus"></i></button>
-                        <button class="btn" style="width:auto; padding:5px 10px; background:#e91e63;" onclick="processCurrentFolder()"><i class="fa-solid fa-print"></i></button>
+                        <button class="btn" style="width:auto; padding:8px 12px; background:#4caf50;" onclick="document.getElementById('fileImport').click()"><i class="fa-solid fa-upload"></i></button>
+                        <button class="btn" style="width:auto; padding:8px 12px; background:#fbc02d; color:#333;" onclick="createFolder()"><i class="fa-solid fa-folder-plus"></i></button>
+                        <button class="btn" style="width:auto; padding:8px 12px; background:#e91e63;" onclick="processCurrentFolder()"><i class="fa-solid fa-file-pdf"></i> Batch</button>
                     </div>
                 </div>
                 <div id="explorerList" class="file-list"></div>
@@ -488,10 +468,12 @@ app.get('/', (req, res) => {
         <!-- EDITOR -->
         <div id="tab-editor" class="tab">
             <div class="card">
-                <input type="text" id="fileName" placeholder="File Name">
-                <textarea id="editor" rows="15"></textarea>
-                <button onclick="saveFile()" class="btn">Save</button>
-                <button onclick="generatePdf()" class="btn" style="background:#00897b;">Generate PDF</button>
+                <input type="text" id="fileName" placeholder="File Name (e.g. 1423_1.md)">
+                <textarea id="editor" rows="18" style="font-family: monospace; font-size:13px;"></textarea>
+                <div style="display:flex; gap:10px;">
+                    <button onclick="saveFile()" class="btn" style="flex:1"><i class="fa-solid fa-floppy-disk"></i> Save</button>
+                    <button onclick="generatePdf()" id="genPdfBtn" class="btn" style="background:#00897b; flex:1"><i class="fa-solid fa-print"></i> Generate PDF</button>
+                </div>
             </div>
         </div>
 
@@ -499,52 +481,74 @@ app.get('/', (req, res) => {
         <div id="tab-themes" class="tab">
             <div class="card">
                 <div class="card-head">Theme Manager</div>
-                <div style="display:flex; gap:5px; margin-bottom:10px;">
+                <div style="display:flex; gap:10px; margin-bottom:10px;">
                     <select id="themeLang" onchange="renderThemeList()" style="width:50%">
                         <option value="english">English</option>
                         <option value="urdu">Urdu</option>
                     </select>
                     <select id="themeName" onchange="loadThemeContent()" style="width:50%"></select>
                 </div>
-                <div style="margin-bottom:10px; font-size:12px; color:#666;">
-                    Active Theme: <span id="activeThemeLabel" style="font-weight:bold"></span>
+                <div style="margin-bottom:10px; font-size:12px; color:#666; background:#f5f5f5; padding:8px; border-radius:6px;">
+                    <i class="fa-solid fa-check-circle" style="color:#4caf50"></i> Active Theme: <span id="activeThemeLabel" style="font-weight:bold; color:#333;"></span>
                 </div>
-                <textarea id="themeEditor" rows="10" style="font-family:monospace; font-size:12px;"></textarea>
+                <textarea id="themeEditor" rows="12" style="font-family:monospace; font-size:12px; background:#fafafa;"></textarea>
                 
-                <div style="display:flex; gap:5px; margin-top:10px;">
-                    <button onclick="saveTheme()" class="btn" style="flex:1">Save/Update</button>
-                    <button onclick="activateTheme()" class="btn" style="background:#4caf50; flex:1">Set Active</button>
+                <div style="display:flex; gap:10px; margin-top:10px;">
+                    <button onclick="saveTheme()" class="btn" style="flex:1"><i class="fa-solid fa-save"></i> Update</button>
+                    <button onclick="activateTheme()" class="btn" style="background:#4caf50; flex:1"><i class="fa-solid fa-bolt"></i> Set Active</button>
                 </div>
-                <button onclick="deleteTheme()" class="btn" style="background:#f44336; margin-top:5px;">Delete Theme</button>
+                <button onclick="deleteTheme()" class="btn" style="background:#f44336; margin-top:10px;"><i class="fa-solid fa-trash"></i> Delete Theme</button>
             </div>
         </div>
 
         <!-- SETTINGS -->
         <div id="tab-settings" class="tab">
             <div class="card">
-                <div class="card-head">Settings</div>
-                <input type="text" id="cfgName" placeholder="Name">
-                <input type="text" id="cfgRoll" placeholder="Roll">
-                <input type="text" id="cfgSem" placeholder="Semester">
-                <hr>
-                <input type="text" id="cfgNameUr" placeholder="نام" style="text-align:right">
-                <input type="text" id="cfgRollUr" placeholder="رول" style="text-align:right">
-                <input type="text" id="cfgSemUr" placeholder="سمسٹر" style="text-align:right">
-                <button onclick="saveConfig()" class="btn">Save Config</button>
+                <div class="card-head">Global Configuration</div>
+                <div style="font-size:12px; color:#666; margin-bottom:10px;">English Details</div>
+                <input type="text" id="cfgName" placeholder="Student Name">
+                <input type="text" id="cfgRoll" placeholder="Registration Number">
+                <input type="text" id="cfgSem" placeholder="Semester (e.g. Autumn 2024)">
+                
+                <div style="font-size:12px; color:#666; margin-top:20px; margin-bottom:10px; text-align:right;">اردو تفصیلات</div>
+                <input type="text" id="cfgNameUr" placeholder="طالب علم کا نام" style="text-align:right; font-family:'JameelNoori', serif; font-size:16px;">
+                <input type="text" id="cfgRollUr" placeholder="رجسٹریشن نمبر" style="text-align:right; font-family:'JameelNoori', serif; font-size:16px;">
+                <input type="text" id="cfgSemUr" placeholder="سمسٹر" style="text-align:right; font-family:'JameelNoori', serif; font-size:16px;">
+                
+                <button onclick="saveConfig()" class="btn" style="margin-top:20px;"><i class="fa-solid fa-check"></i> Save Settings</button>
             </div>
         </div>
     </main>
 
     <nav>
-        <button class="nav-btn active" onclick="switchTab('home')"><i class="fa-solid fa-house"></i></button>
-        <button class="nav-btn" onclick="switchTab('editor')"><i class="fa-solid fa-pen-to-square"></i></button>
-        <button class="nav-btn" onclick="switchTab('themes')"><i class="fa-solid fa-palette"></i></button>
-        <button class="nav-btn" onclick="switchTab('settings')"><i class="fa-solid fa-gear"></i></button>
+        <button class="nav-btn active" onclick="switchTab('home')"><i class="fa-solid fa-folder-open"></i><span>Files</span></button>
+        <button class="nav-btn" onclick="switchTab('editor')"><i class="fa-solid fa-pen-to-square"></i><span>Editor</span></button>
+        <button class="nav-btn" onclick="switchTab('themes')"><i class="fa-solid fa-palette"></i><span>Themes</span></button>
+        <button class="nav-btn" onclick="switchTab('settings')"><i class="fa-solid fa-gear"></i><span>Settings</span></button>
     </nav>
+    
+    <div id="toast">Message</div>
 
     <script>
         let currentPath = '';
         let themesData = {};
+
+        // --- MODERN UI TOAST ---
+        function showToast(msg) {
+            const toast = document.getElementById("toast");
+            toast.innerHTML = msg;
+            toast.className = "show";
+            setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 3000);
+        }
+        
+        function setStatus(msg, isLoading = false) {
+            const el = document.getElementById('status');
+            if (isLoading) {
+                el.innerHTML = '<span class="spinner"></span> ' + msg;
+            } else {
+                el.innerHTML = '<i class="fa-solid fa-circle-check" style="color:#4caf50"></i> ' + msg;
+            }
+        }
 
         // --- INIT ---
         loadExplorer('');
@@ -612,37 +616,41 @@ app.get('/', (req, res) => {
                 body: JSON.stringify({lang, name, css})
             });
             await loadThemes();
+            showToast("Theme Saved Successfully!");
         }
 
         async function activateTheme() {
             const lang = document.getElementById('themeLang').value;
             const name = document.getElementById('themeName').value;
-            if(name === '__NEW__') return alert("Save it first");
+            if(name === '__NEW__') return showToast("Save it first");
             await fetch('/api/themes/activate', {
                 method:'POST', headers:{'Content-Type':'application/json'},
                 body: JSON.stringify({lang, name})
             });
             await loadThemes();
+            showToast(name + " Activated!");
         }
 
         async function deleteTheme() {
             const lang = document.getElementById('themeLang').value;
             const name = document.getElementById('themeName').value;
-            if(name === '__NEW__') return;
+            if(name === '__NEW__' || name === 'Default') return showToast("Cannot delete this theme");
             if(!confirm("Delete theme: " + name + "?")) return;
             const res = await fetch('/api/themes/delete', {
                 method:'POST', headers:{'Content-Type':'application/json'},
                 body: JSON.stringify({lang, name})
             });
             const d = await res.json();
-            if(d.success) await loadThemes();
-            else alert(d.error);
+            if(d.success) {
+                await loadThemes();
+                showToast("Theme Deleted");
+            }
         }
 
         // --- EXPLORER & CRUD ---
         async function loadExplorer(path) {
             currentPath = path;
-            document.getElementById('currentPathLabel').innerText = path || '/';
+            document.getElementById('currentPathLabel').innerText = path || '/root';
             const res = await fetch('/api/files?path=' + path);
             const files = await res.json();
             const list = document.getElementById('explorerList');
@@ -684,15 +692,17 @@ app.get('/', (req, res) => {
                 body: JSON.stringify({ path: currentPath ? currentPath + '/' + name : name })
             });
             loadExplorer(currentPath);
+            showToast("Folder Created");
         }
 
         async function deleteItem(path) {
-            if(!confirm("Delete " + path + "?")) return;
+            if(!confirm("Are you sure you want to delete " + path + "?")) return;
             await fetch('/api/delete', {
                 method:'POST', headers:{'Content-Type':'application/json'},
                 body: JSON.stringify({ path })
             });
             loadExplorer(currentPath);
+            showToast("Item Deleted");
         }
 
         function importFile(input) {
@@ -709,6 +719,7 @@ app.get('/', (req, res) => {
                     })
                 });
                 loadExplorer(currentPath);
+                showToast("File Imported");
             };
             reader.readAsText(file);
         }
@@ -718,22 +729,24 @@ app.get('/', (req, res) => {
             const res = await fetch('/api/files?path=' + currentPath);
             const files = await res.json();
             const mdFiles = files.filter(f => !f.isDir && f.name.endsWith('.md'));
-            if(mdFiles.length === 0) return alert('No Markdown files here.');
-            if(!confirm("Generate " + mdFiles.length + " PDFs?")) return;
-            const status = document.getElementById('status');
+            if(mdFiles.length === 0) return showToast('No Markdown files found here.');
+            if(!confirm("Generate PDFs for " + mdFiles.length + " files?")) return;
+            
             for(let i=0; i<mdFiles.length; i++) {
-                status.innerText = "Processing " + (i+1) + "/" + mdFiles.length;
+                setStatus("Batch: " + (i+1) + "/" + mdFiles.length, true);
                 const f = mdFiles[i];
                 const cRes = await fetch('/api/file-content?path='+f.relativePath);
                 const cData = await cRes.json();
                 await doGenerate(cData.content, f.name, false);
             }
-            status.innerText = "Ready";
-            alert("Batch Complete");
+            setStatus("Ready");
+            showToast('<i class="fa-solid fa-check"></i> Batch Generation Complete!');
         }
 
         async function magicFind() {
             const codes = document.getElementById('magicCode').value.split(' ').filter(c=>c);
+            if(codes.length === 0) return showToast("Enter course codes!");
+            
             const res = await fetch('/api/magic-find', {
                 method:'POST', headers:{'Content-Type':'application/json'},
                 body: JSON.stringify({ codes })
@@ -741,23 +754,26 @@ app.get('/', (req, res) => {
             const data = await res.json();
             const resDiv = document.getElementById('magicResults');
             resDiv.innerHTML = '';
-            if(data.matches.length > 0) {
+            
+            if(data.matches && data.matches.length > 0) {
                 const btn = document.createElement('button');
                 btn.className = 'btn';
                 btn.style.background = '#e91e63';
-                btn.innerText = 'Generate All (' + data.matches.length + ')';
+                btn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> Generate Found (' + data.matches.length + ')';
                 btn.onclick = async () => {
                      for(let i=0; i<data.matches.length; i++) {
-                        document.getElementById('status').innerText = 'Magic: '+(i+1);
+                        setStatus('Magic Gen: '+(i+1)+'/'+data.matches.length, true);
                         const m = data.matches[i];
                         const cRes = await fetch('/api/file-content?path='+m.relativePath);
                         const cData = await cRes.json();
                         await doGenerate(cData.content, m.fileName, false);
                     }
-                    document.getElementById('status').innerText = 'Ready';
-                    alert("Done");
+                    setStatus('Ready');
+                    showToast("Magic Generation Done!");
                 };
                 resDiv.appendChild(btn);
+            } else {
+                showToast("No matching files found.");
             }
         }
 
@@ -778,7 +794,7 @@ app.get('/', (req, res) => {
                 method:'POST', headers:{'Content-Type':'application/json'},
                 body: JSON.stringify({ path: fullPath, content })
             });
-            alert('Saved');
+            showToast('File Saved!');
             loadExplorer(currentPath);
         }
 
@@ -788,15 +804,22 @@ app.get('/', (req, res) => {
                 cfg[id] = document.getElementById(id).value;
             });
             localStorage.setItem('aiou_config', JSON.stringify(cfg));
-            alert('Settings Saved');
+            showToast('Configuration Saved!');
         }
 
         async function generatePdf() {
             const content = document.getElementById('editor').value;
             const filename = document.getElementById('fileName').value;
-            document.getElementById('status').innerText = 'Generating...';
+            setStatus('Compiling PDF...', true);
+            const btn = document.getElementById('genPdfBtn');
+            btn.disabled = true;
+            btn.style.opacity = '0.5';
+            
             await doGenerate(content, filename, true);
-            document.getElementById('status').innerText = 'Ready';
+            
+            btn.disabled = false;
+            btn.style.opacity = '1';
+            setStatus('Ready');
         }
 
         async function doGenerate(content, filename, showAlert) {
@@ -812,15 +835,14 @@ app.get('/', (req, res) => {
                 });
                 const data = await res.json();
                 if(showAlert) {
-                    if(data.success) alert('PDF Saved: ' + data.path);
-                    else alert('Error: ' + data.error);
+                    if(data.success) showToast('PDF Saved Successfully!');
+                    else showToast('Error: ' + data.error);
                 }
-            } catch(e) { console.error(e); }
+            } catch(e) { 
+                console.error(e); 
+                if(showAlert) showToast("Connection Error");
+            }
         }
     </script>
 </body>
 </html>
-    `);
-});
-
-app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
